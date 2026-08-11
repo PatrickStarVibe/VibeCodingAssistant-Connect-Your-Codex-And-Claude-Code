@@ -1,0 +1,2056 @@
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+
+import { getDefaultAssistantRoot } from './config.js';
+import { normalizeWorkflowDifficulty, WORKFLOW_DIFFICULTIES } from './difficulty.js';
+import {
+  parseArchitectResponsesBlock,
+  parseReviewerBlockerBlock,
+} from './blockerLedger.js';
+import { sanitizeTextForArtifact } from './textSanitizer.js';
+import { runFile, type RunResult } from './processRunner.js';
+import type {
+  AgentPromptRecord,
+  AgentProfileConfig,
+  AllowedAction,
+  ArtifactName,
+  BridgeAgentDecision,
+  BridgeAgentInput,
+  BridgeToolName,
+  ComposedReply,
+  ControlChatResult,
+  FinalReviewResult,
+  ExecutionUnitState,
+  HeavyWorkflowRoleName,
+  ImplementationMode,
+  ImplementationResult,
+  IntentName,
+  IntentResult,
+  AssistantConfig,
+  AssistantRouteResult,
+  AssistantTextResult,
+  OrchestratorDecision,
+  OrchestratorDecisionInput,
+  PlanPackDraft,
+  PlanResult,
+  ReviewResult,
+  TaskProposal,
+  TaskState,
+  PendingUserDecisionSource,
+  WorkflowDifficulty,
+} from './types.js';
+import { normalizePendingUserDecision, parseUserDecisionBlock } from './userDecision.js';
+
+export interface AssistantAdapter {
+  decideBridgeAction?(input: BridgeAgentInput): Promise<BridgeAgentDecision>;
+  decideNextAction(input: OrchestratorDecisionInput): Promise<OrchestratorDecision>;
+  classifyIntent(input: {
+    userMessage: string;
+    state: TaskState;
+    allowedActions: AllowedAction[];
+    recentContext: string;
+    config: AssistantConfig;
+  }): Promise<IntentResult>;
+  composeReply(input: {
+    rawMessage: string;
+    state: TaskState;
+    pendingPrompt?: string;
+    userQuestion?: string;
+    config: AssistantConfig;
+  }): Promise<ComposedReply>;
+  createRevisionInstructions(input: {
+    task: string;
+    projectContext: string;
+    initialPlan: string;
+    review: string;
+    requestedChanges: string[];
+    state: TaskState;
+    config: AssistantConfig;
+  }): Promise<AssistantTextResult>;
+  explainRevisedPlan(input: {
+    task: string;
+    projectContext: string;
+    revisedPlan: string;
+    review: string;
+    state: TaskState;
+    config: AssistantConfig;
+  }): Promise<AssistantTextResult>;
+  answerQuestion(input: { question: string; context: string; projectContext: string; state: TaskState; config: AssistantConfig }): Promise<string>;
+  interpretAmbiguousReply(input: { reply: string; context: string; state: TaskState; config: AssistantConfig }): Promise<string>;
+  handleControlChat(input: {
+    message: string;
+    pendingProposal?: TaskProposal;
+    mode: 'message' | 'edit';
+    projectContext: string;
+    config: AssistantConfig;
+  }): Promise<ControlChatResult>;
+  routeAfterFinalReview(input: {
+    finalReview: string;
+    verificationLog: string;
+    state: TaskState;
+    config: AssistantConfig;
+  }): Promise<AssistantRouteResult>;
+}
+
+export interface HeavyAgentAdapter {
+  createInitialPlan(input: { task: string; projectContext: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig }): Promise<PlanResult>;
+  reviewPlan(input: { task: string; projectContext: string; initialPlan: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig; blockerLedgerText?: string }): Promise<ReviewResult>;
+  revisePlan(input: {
+    task: string;
+    projectContext: string;
+    initialPlan: string;
+    review: string;
+    requestedChanges: string[];
+    difficulty: WorkflowDifficulty;
+    state: TaskState;
+    config: AssistantConfig;
+    blockerLedgerText?: string;
+  }): Promise<PlanResult>;
+  implement(input: {
+    task: string;
+    projectContext: string;
+    revisedPlan: string;
+    executionUnit: ExecutionUnitState;
+    state: TaskState;
+    config: AssistantConfig;
+    mode: ImplementationMode;
+    finalReviewReason?: string;
+    priorImplementationLog?: string;
+    priorVerificationLog?: string;
+  }): Promise<ImplementationResult>;
+  finalReview(input: {
+    task: string;
+    projectContext: string;
+    revisedPlan: string;
+    implementationLog: string;
+    verificationLog: string;
+    state: TaskState;
+    config: AssistantConfig;
+  }): Promise<FinalReviewResult>;
+}
+
+interface ChatCompletionMessage {
+  role: 'system' | 'user';
+  content: string;
+}
+
+interface ChatCompletionTool {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
+function parseMaybeJson(content: string): unknown {
+  try {
+    return JSON.parse(content) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function assistantTextFromContent(content: string, decisionSource: PendingUserDecisionSource): AssistantTextResult {
+  const payload = record(parseMaybeJson(content));
+  const result: AssistantTextResult = {
+    markdown: stringValue(payload.markdown) ?? stringValue(payload.content) ?? content,
+    needsUserDecision: booleanValue(payload.needsUserDecision) ?? false,
+  };
+  const userPrompt = stringValue(payload.userPrompt);
+  if (userPrompt) result.userPrompt = userPrompt;
+  const decision = normalizePendingUserDecision(payload.userDecision, decisionSource);
+  if (decision.ok) result.userDecision = decision.decision;
+  return result;
+}
+
+function routeFromContent(content: string): AssistantRouteResult {
+  const payload = record(parseMaybeJson(content));
+  const route = stringValue(payload.route);
+  if (
+    route === 'complete' ||
+    route === 'route_to_implementer' ||
+    route === 'route_to_planner' ||
+    route === 'ask_user_direction'
+  ) {
+    const result: AssistantRouteResult = {
+      route,
+      reason: stringValue(payload.reason) ?? content,
+    };
+    const userPrompt = stringValue(payload.userPrompt);
+    if (userPrompt) result.userPrompt = userPrompt;
+    const decision = normalizePendingUserDecision(payload.userDecision, 'final_review');
+    if (decision.ok) result.userDecision = decision.decision;
+    return result;
+  }
+
+  return {
+    route: 'ask_user_direction',
+    reason: 'Assistant route response was not valid JSON.',
+    userPrompt: content,
+  };
+}
+
+const INTENT_NAMES = new Set<IntentName>([
+  'approve',
+  'reject',
+  'revise',
+  'difficulty',
+  'stop',
+  'status',
+  'summary',
+  'accept',
+  'note',
+  'restart',
+  'ask',
+  'unknown',
+]);
+
+const ARTIFACT_NAMES = new Set<ArtifactName>([
+  'original-task',
+  'initial-plan',
+  'review',
+  'revision-instructions',
+  'plan-rounds-log',
+  'revised-plan',
+  'assistant-explanation',
+  'qa-log',
+  'decision-log',
+  'implementation-log',
+  'git-pre-status',
+  'git-post-status',
+  'git-pre-diff',
+  'git-post-diff',
+  'followup-git-pre-status',
+  'followup-git-pre-diff',
+  'followup-git-post-status',
+  'followup-git-post-diff',
+  'test-build-log',
+  'deferred-issues',
+  'final-review',
+  'agent-prompts',
+  'agent-prompt-preview',
+  'final-report',
+]);
+
+const ORCHESTRATOR_ACTIONS = new Set<OrchestratorDecision['action']>([
+  'respond',
+  'approve_implementation',
+  'forward_to_workflow',
+  'show_artifact',
+  'ask_clarification',
+  'wait_for_user',
+]);
+
+const BRIDGE_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'create_task',
+  'choose_difficulty',
+  'approve_plan',
+  'run_followup',
+  'accept_task',
+  'answer_user_direction',
+  'revise_plan',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'switch_project',
+  'add_project',
+  'list_projects',
+  'schedule_task_to_project_chat',
+  'create_project_chat',
+  'create_new_task_from_task_chat',
+]);
+
+const CONTROL_BRIDGE_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'schedule_task_to_project_chat',
+  'create_project_chat',
+  'create_task',
+  'switch_project',
+  'add_project',
+  'list_projects',
+]);
+
+const IDLE_PROJECT_CHAT_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'create_task',
+  'show_artifact',
+  'list_projects',
+]);
+
+const DIFFICULTY_GATE_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'choose_difficulty',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const READY_FOR_DECISION_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'approve_plan',
+  'revise_plan',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const IMPLEMENTATION_APPROVED_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const AWAITING_USER_ACCEPTANCE_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'accept_task',
+  'revise_plan',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const WAITING_USER_DIRECTION_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'answer_user_direction',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const IN_FLIGHT_TASK_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const TERMINAL_TASK_TOOL_NAMES = new Set<BridgeToolName>(
+  [...IN_FLIGHT_TASK_TOOL_NAMES].filter((toolName) => toolName !== 'stop_task'),
+);
+
+const BOUND_TASK_FALLBACK_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+function intentResultFromContent(content: string): IntentResult {
+  const payload = record(parseMaybeJson(content));
+  const rawIntent = stringValue(payload.intent);
+  const intent = rawIntent && INTENT_NAMES.has(rawIntent as IntentName)
+    ? rawIntent as IntentName
+    : 'unknown';
+  const confidence = Math.max(0, Math.min(1, numberValue(payload.confidence) ?? 0));
+  const difficulty = stringValue(payload.difficulty);
+  const normalizedDifficulty = difficulty ? normalizeWorkflowDifficulty(difficulty) : undefined;
+  const result: IntentResult = {
+    intent,
+    confidence,
+    requiresClarification: booleanValue(payload.requiresClarification) ?? (intent === 'unknown' || confidence < 0.6),
+    userFacingInterpretation: stringValue(payload.userFacingInterpretation) ?? '我还不确定你想让我怎么处理这条消息。',
+  };
+  if (normalizedDifficulty) result.difficulty = normalizedDifficulty;
+  const instruction = stringValue(payload.instruction);
+  if (instruction) result.instruction = instruction;
+  const note = stringValue(payload.note);
+  if (note) result.note = note;
+  const artifact = stringValue(payload.artifact);
+  if (artifact && ARTIFACT_NAMES.has(artifact as ArtifactName)) result.artifact = artifact as ArtifactName;
+  return result;
+}
+
+function orchestratorDecisionFromContent(content: string): OrchestratorDecision {
+  const payload = record(parseMaybeJson(content));
+  const rawAction = stringValue(payload.action);
+  if (!rawAction || !ORCHESTRATOR_ACTIONS.has(rawAction as OrchestratorDecision['action'])) {
+    return {
+      action: 'wait_for_user',
+      reason: 'Assistant orchestrator response was not valid JSON.',
+      text: '我收到你的消息了，但刚才编排决策没有返回有效 JSON，所以没有推进 workflow。请你再明确说一次。',
+      confidence: 0,
+    };
+  }
+
+  const rawIntent = stringValue(payload.intent);
+  const rawDifficulty = stringValue(payload.difficulty);
+  const rawArtifact = stringValue(payload.artifact);
+  const decision: OrchestratorDecision = {
+    action: rawAction as OrchestratorDecision['action'],
+    confidence: Math.max(0, Math.min(1, numberValue(payload.confidence) ?? 0)),
+  };
+  if (rawIntent && INTENT_NAMES.has(rawIntent as IntentName)) decision.intent = rawIntent as IntentName;
+  const normalizedDifficulty = rawDifficulty ? normalizeWorkflowDifficulty(rawDifficulty) : undefined;
+  if (normalizedDifficulty) decision.difficulty = normalizedDifficulty;
+  const instruction = stringValue(payload.instruction);
+  if (instruction) decision.instruction = instruction;
+  const text = stringValue(payload.text);
+  if (text) decision.text = text;
+  if (rawArtifact && ARTIFACT_NAMES.has(rawArtifact as ArtifactName)) decision.artifact = rawArtifact as ArtifactName;
+  const question = stringValue(payload.question);
+  if (question) decision.question = question;
+  const reason = stringValue(payload.reason);
+  if (reason) decision.reason = reason;
+  const reasoning = stringValue(payload.reasoning);
+  if (reasoning) decision.reasoning = reasoning;
+  if (typeof payload.userConsentForContinuation === 'boolean') decision.userConsentForContinuation = payload.userConsentForContinuation;
+  return decision;
+}
+
+function bridgeDecisionFromToolCall(toolCall: unknown, availableToolNames = BRIDGE_TOOL_NAMES): BridgeAgentDecision | undefined {
+  const call = record(toolCall);
+  const fn = record(call.function);
+  const name = stringValue(fn.name);
+  if (!name || !availableToolNames.has(name as BridgeToolName)) return undefined;
+  const rawArguments = stringValue(fn.arguments);
+  const args = record(rawArguments ? parseMaybeJson(rawArguments) : {});
+  return {
+    kind: 'tool_call',
+    toolCall: {
+      name: name as BridgeToolName,
+      arguments: args,
+    },
+  };
+}
+
+function bridgeDecisionFromContent(content: string, availableToolNames = BRIDGE_TOOL_NAMES): BridgeAgentDecision {
+  const payload = record(parseMaybeJson(content));
+  const toolName = stringValue(payload.toolName) ?? stringValue(payload.tool);
+  if (toolName && availableToolNames.has(toolName as BridgeToolName)) {
+    const reasoning = stringValue(payload.reasoning);
+    return {
+      kind: 'tool_call',
+      toolCall: {
+        name: toolName as BridgeToolName,
+        arguments: record(payload.arguments),
+        ...(reasoning ? { reasoning } : {}),
+      },
+    };
+  }
+  return { kind: 'reply', text: stringValue(payload.text) ?? stringValue(payload.markdown) ?? content };
+}
+
+function stringArrayValue(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const items = value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
+    return items.length > 0 ? items : undefined;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    return value.split(/\r?\n/).map((line) => line.replace(/^[-*]\s*/, '').trim()).filter(Boolean);
+  }
+  return undefined;
+}
+
+function bridgeTools(input?: BridgeAgentInput): ChatCompletionTool[] {
+  const availableToolNames = bridgeToolNamesForInput(input);
+  const object = (properties: Record<string, unknown>, required: string[] = []) => ({
+    type: 'object',
+    properties,
+    required,
+    additionalProperties: false,
+  });
+  const string = (description: string) => ({ type: 'string', description });
+  return ([
+    {
+      type: 'function',
+      function: {
+        name: 'reply_to_user',
+        description: '直接回复用户，不推进 workflow。',
+        parameters: object({ text: string('要发给用户的中文回复。') }, ['text']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'create_task',
+        description: '从当前聊天创建新 workflow task。',
+        parameters: object({
+          prompt: string('用户原始任务 prompt，尽量原文保留。'),
+          title: string('可选短标题。'),
+          projectId: string('可选项目 id。'),
+        }, ['prompt']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'choose_difficulty',
+        description: '为当前 task 选择 low/medium/high/extra-high 难度并开始规划。',
+        parameters: object({
+          taskId: string('可选 task id；缺省时使用当前绑定 task。'),
+          difficulty: { type: 'string', enum: WORKFLOW_DIFFICULTIES, description: '工作难度。' },
+          instruction: string('可选，用户给 Planner/Developer 的额外约束。'),
+        }, ['difficulty']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'approve_plan',
+        description: '批准当前计划并启动实现。',
+        parameters: object({
+          taskId: string('可选 task id；缺省时使用当前绑定 task。'),
+          instruction: string('可选实现约束。'),
+        }),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'accept_task',
+        description: '最终验收当前 task，生成 task-record 并完成任务。只用于 awaiting_user_acceptance 阶段。',
+        parameters: object({
+          taskId: string('可选 task id；缺省时使用当前绑定 task。'),
+          instruction: string('可选验收备注。'),
+        }),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'run_followup',
+        description: 'Run the scoped Final Review follow-up unit. Use only when task.status is implementation_approved and the task has implementationFollowup.',
+        parameters: object({
+          taskId: string('Optional task id; defaults to the currently bound task.'),
+          instruction: string('Optional follow-up constraint from the user.'),
+        }),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'answer_user_direction',
+        description: '回答当前 task 正在等待的用户方向/选项确认。只用于 waiting_user_direction 阶段；不要用 accept_task 或 revise_plan 代替。',
+        parameters: object({
+          taskId: string('可选 task id；缺省时使用当前绑定 task。'),
+          answer: string('用户对 pendingUserPrompt 的回答，保留选项号和关键理由。'),
+        }, ['answer']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'revise_plan',
+        description: '按用户意见修改计划并重新规划。',
+        parameters: object({
+          taskId: string('可选 task id；缺省时使用当前绑定 task。'),
+          instruction: string('用户的修改意见。'),
+        }, ['instruction']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'stop_task',
+        description: '停止当前 task。',
+        parameters: object({
+          taskId: string('可选 task id；缺省时使用当前绑定 task。'),
+          reason: string('可选停止原因。'),
+        }),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'ask_task_question',
+        description: '围绕当前 task/plan/artifacts 回答用户问题，不推进 workflow。',
+        parameters: object({
+          taskId: string('可选 task id；缺省时使用当前绑定 task。'),
+          question: string('用户问题。'),
+        }, ['question']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'show_status',
+        description: '仅当用户明确询问 workflow/task 状态、阶段、进度或 summary 时展示当前 task 状态。',
+        parameters: object({ taskId: string('可选 task id；缺省时使用当前绑定 task。') }),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'show_artifact',
+        description: '展示某个 task artifact。',
+        parameters: object({
+          taskId: string('可选 task id；缺省时使用当前绑定 task。'),
+          artifact: { type: 'string', enum: [...ARTIFACT_NAMES], description: 'artifact 名称。' },
+        }, ['artifact']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'switch_project',
+        description: '切换当前聊天的新任务默认项目。',
+        parameters: object({ projectId: string('项目 id。') }, ['projectId']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'add_project',
+        description: '注册一个新的本地项目，并把当前聊天的新任务默认项目切换到它。只在用户已经提供项目位置 targetDir 时使用。',
+        parameters: object({
+          targetDir: string('本地项目文件夹路径。用户没提供时不要调用此工具，先询问项目位置。'),
+          id: string('可选项目 id；缺省时从文件夹名自动生成。'),
+          name: string('可选项目显示名；缺省时从文件夹名自动生成。'),
+          docsDir: string('可选项目文档目录；缺省为 VibeCodingAssistant 内的 project-docs/<id>。'),
+          taskRecordRoot: string('可选 task record 根目录；缺省为 <targetDir>/task。'),
+        }, ['targetDir']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'list_projects',
+        description: '列出当前已注册项目，并标记当前聊天 active project 和默认 project。',
+        parameters: object({}),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'schedule_task_to_project_chat',
+        description: 'Schedule a new workflow task from Control/Private Chat into an idle Project Chat for a specific project. Use this only when the project is clear.',
+        parameters: object({
+          projectId: string('Required project id. If the user did not make the project clear, ask a clarification question instead of calling this tool.'),
+          prompt: string('The original user task prompt, preserved as much as possible.'),
+          title: string('Optional short task title.'),
+          targetChatId: string('Optional Project Chat id. If omitted, VibeCodingAssistant picks the earliest idle Project Chat for the project.'),
+        }, ['projectId', 'prompt']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'create_project_chat',
+        description: 'Create a new long-lived Project Chat / Project Group for a registered project. Do not use this automatically just because all groups are busy; ask the user first.',
+        parameters: object({
+          projectId: string('Required project id.'),
+          name: string('Optional group name. If omitted, VibeCodingAssistant uses the project name and sequence number.'),
+        }, ['projectId']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'create_new_task_from_task_chat',
+        description: '从已绑定 task 的聊天里另开一个新 task。',
+        parameters: object({
+          prompt: string('新任务 prompt，尽量原文保留。'),
+          title: string('可选短标题。'),
+          projectId: string('可选项目 id。'),
+        }, ['prompt']),
+      },
+    },
+  ] as ChatCompletionTool[]).filter((tool) => availableToolNames.has(tool.function.name as BridgeToolName));
+}
+
+export function bridgeToolNamesForTaskStatus(status: TaskState['status']): Set<BridgeToolName> {
+  switch (status) {
+    case 'created':
+    case 'awaiting_difficulty_selection':
+      return DIFFICULTY_GATE_TOOL_NAMES;
+    case 'ready_for_decision':
+      return READY_FOR_DECISION_TOOL_NAMES;
+    case 'implementation_approved':
+      return IMPLEMENTATION_APPROVED_TOOL_NAMES;
+    case 'awaiting_user_acceptance':
+      return AWAITING_USER_ACCEPTANCE_TOOL_NAMES;
+    case 'waiting_user_direction':
+      return WAITING_USER_DIRECTION_TOOL_NAMES;
+    case 'completed':
+    case 'stopped':
+      return TERMINAL_TASK_TOOL_NAMES;
+    case 'planning_requested':
+    case 'planning':
+    case 'task_artifacts_persisting':
+    case 'execution_queue_ready':
+    case 'implementing':
+    case 'execution_unit_implementing':
+    case 'execution_unit_testing':
+    case 'execution_unit_result_recording':
+    case 'next_execution_unit_or_all_done':
+    case 'implemented':
+    case 'final_reviewing':
+    case 'final_review_routing':
+    case 'task_recording':
+      return IN_FLIGHT_TASK_TOOL_NAMES;
+  }
+}
+
+export function bridgeToolNamesForInput(input?: BridgeAgentInput): Set<BridgeToolName> {
+  if (!input) return BRIDGE_TOOL_NAMES;
+  if (input.chat.chatKind === 'control') return CONTROL_BRIDGE_TOOL_NAMES;
+  if (input.task?.status) {
+    const toolNames = new Set(bridgeToolNamesForTaskStatus(input.task.status));
+    if (input.task.status === 'implementation_approved' && input.task.implementationFollowup) {
+      toolNames.add('run_followup');
+    }
+    return toolNames;
+  }
+  if (input.chat.boundTaskId) return BOUND_TASK_FALLBACK_TOOL_NAMES;
+  if (input.chat.chatKind === 'project') return IDLE_PROJECT_CHAT_TOOL_NAMES;
+  return BRIDGE_TOOL_NAMES;
+}
+
+function renderBridgeUserPrompt(input: BridgeAgentInput): string {
+  const systemState = {
+    chat: input.chat,
+    projectChatsSummary: input.projectChatsSummary,
+    task: input.task,
+    runningJob: input.runningJob,
+    liveProcesses: input.liveProcesses,
+    projects: input.projects,
+  };
+  const sections: string[] = [];
+  sections.push(`## Real system state (highest priority)\n${JSON.stringify(systemState, null, 2)}`);
+  if (input.chatSummary) {
+    sections.push([
+      '## Chat summary (mid-term memory)',
+      `Updated at ${input.chatSummary.updatedAt}. Covers ${input.chatSummary.messageCountCovered} earlier messages.`,
+      '',
+      input.chatSummary.summary,
+    ].join('\n'));
+  }
+  if (input.recentMessages && input.recentMessages.length > 0) {
+    sections.push([
+      '## Recent messages (short-term memory, oldest first; the latest user message below is NOT in this list)',
+      ...input.recentMessages.map((entry) => {
+        const speaker = entry.role === 'user' ? 'User' : 'Assistant';
+        return `- [${entry.at}] ${speaker}: ${truncateForPrompt(entry.text, 800)}`;
+      }),
+    ].join('\n'));
+  }
+  if (input.retrievedMemory && input.retrievedMemory.snippets.length > 0) {
+    sections.push([
+      '## Retrieved long-term memory (background; never override the latest user message)',
+      `Query: ${input.retrievedMemory.query}`,
+      input.retrievedMemory.projectId ? `Project: ${input.retrievedMemory.projectId}` : '',
+      ...input.retrievedMemory.snippets.map((snippet) => {
+        const header = snippet.heading ? `${snippet.source}#${snippet.heading}` : snippet.source;
+        return `### ${header}\n${truncateForPrompt(snippet.text, 1200)}`;
+      }),
+    ].filter(Boolean).join('\n'));
+  }
+  sections.push(`## Latest user message\n${input.latestUserMessage}`);
+  return sections.join('\n\n');
+}
+
+function truncateForPrompt(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 20)).trimEnd()}\n[truncated]`;
+}
+
+function controlChatFromContent(content: string): ControlChatResult {
+  const payload = record(parseMaybeJson(content));
+  const kind = stringValue(payload.kind);
+  if (kind === 'proposal') {
+    const proposal = record(payload.proposal);
+    const title = stringValue(proposal.title);
+    const task = stringValue(proposal.task) ?? stringValue(proposal.prompt);
+    if (title && task) {
+      const markdown = stringValue(payload.markdown);
+      return {
+        kind: 'proposal',
+        ...(markdown ? { markdown } : {}),
+        proposal: {
+          interpretedIntent: stringValue(proposal.interpretedIntent) ?? stringValue(proposal.intent) ?? `整理成一个可能的 assistant workflow 任务：${title}`,
+          title,
+          task,
+          wouldDo: stringArrayValue(proposal.wouldDo) ?? ['在你确认后，把建议的任务内容作为 workflow 输入。'],
+          wouldNotDo: stringArrayValue(proposal.wouldNotDo) ?? ['不会在你确认前启动实现、规划或其他 agent 调用。'],
+          suggestedNextAction: stringValue(proposal.suggestedNextAction) ?? '可以说「创建任务」确认，或继续补充修改。',
+        },
+      };
+    }
+  }
+  if (kind === 'clarify') {
+    return { kind: 'clarify', markdown: stringValue(payload.markdown) ?? content };
+  }
+  if (kind === 'confirm_pending_proposal' || kind === 'create_task' || kind === 'confirm') {
+    const markdown = stringValue(payload.markdown);
+    return { kind: 'confirm_pending_proposal', ...(markdown ? { markdown } : {}) };
+  }
+  if (kind === 'cancel_pending_proposal' || kind === 'cancel') {
+    const markdown = stringValue(payload.markdown);
+    return { kind: 'cancel_pending_proposal', ...(markdown ? { markdown } : {}) };
+  }
+  return { kind: 'answer', markdown: stringValue(payload.markdown) ?? content };
+}
+
+export async function loadAssistantSkill(name: string): Promise<string> {
+  try {
+    return await readFile(resolve(getDefaultAssistantRoot(), 'assistant-skills', `${name}.md`), 'utf8');
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return '';
+    }
+    throw error;
+  }
+}
+
+function normalizedBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, '');
+}
+
+const COMMAND_PROFILE_KINDS = new Set(['command', 'codex', 'claude']);
+
+function isCommandBackedProfile(profile: AgentProfileConfig): boolean {
+  return COMMAND_PROFILE_KINDS.has(profile.kind.trim().toLowerCase()) || Boolean(profile.command?.trim());
+}
+
+interface AssistantApiRequestConfig {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+}
+
+export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
+  constructor(
+    private readonly profile: AgentProfileConfig,
+    private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly profileName = 'assistant',
+  ) {}
+
+  private async assistantSystem(): Promise<string> {
+    return loadAssistantSkill('vibecoding-assistant');
+  }
+
+  private requestConfig(): AssistantApiRequestConfig {
+    if (isCommandBackedProfile(this.profile)) {
+      throw new Error(
+        `Assistant profile "${this.profileName}" is command-backed, but assistant chat requires an OpenAI-compatible API profile with model, baseUrl, and apiKeyEnv.`,
+      );
+    }
+    const apiKeyEnv = this.profile.apiKeyEnv?.trim();
+    if (!apiKeyEnv) {
+      throw new Error(
+        `Assistant profile "${this.profileName}" is missing apiKeyEnv. Configure profiles.${this.profileName}.apiKeyEnv and set that variable in .env.local or process env.`,
+      );
+    }
+    const apiKey = this.env[apiKeyEnv]?.trim();
+    if (!apiKey) {
+      throw new Error(
+        `Assistant profile "${this.profileName}" expects API key env var ${apiKeyEnv}, but it is not set. Set ${apiKeyEnv} in .env.local or process env.`,
+      );
+    }
+    const model = this.profile.model?.trim();
+    if (!model) {
+      throw new Error(`Assistant profile "${this.profileName}" is missing model.`);
+    }
+    const baseUrl = this.profile.baseUrl?.trim();
+    if (!baseUrl) {
+      throw new Error(`Assistant profile "${this.profileName}" is missing baseUrl for the OpenAI-compatible /chat/completions endpoint.`);
+    }
+    return { apiKey, baseUrl: normalizedBaseUrl(baseUrl), model };
+  }
+
+  private async chat(messages: ChatCompletionMessage[], jsonMode = false): Promise<string> {
+    const requestConfig = this.requestConfig();
+
+    const body: Record<string, unknown> = {
+      model: requestConfig.model,
+      messages,
+      temperature: 0.1,
+    };
+    if (jsonMode) {
+      body.response_format = { type: 'json_object' };
+    }
+
+    const response = await fetch(`${requestConfig.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${requestConfig.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    const responseText = await response.text();
+    if (!response.ok) {
+      throw new Error(`VibeCodingAssistant request failed: HTTP ${response.status} ${responseText.slice(0, 500)}`);
+    }
+    const payload = record(parseMaybeJson(responseText));
+    const choices = Array.isArray(payload.choices) ? payload.choices : [];
+    const message = record(record(choices[0]).message);
+    return stringValue(message.content) ?? responseText;
+  }
+
+  private async chatWithTools(messages: ChatCompletionMessage[], tools: ChatCompletionTool[]): Promise<BridgeAgentDecision> {
+    const requestConfig = this.requestConfig();
+
+    const body: Record<string, unknown> = {
+      model: requestConfig.model,
+      messages,
+      temperature: 0.1,
+      tools,
+      tool_choice: 'auto',
+    };
+
+    const response = await fetch(`${requestConfig.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${requestConfig.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    const responseText = await response.text();
+    if (!response.ok) {
+      throw new Error(`VibeCodingAssistant request failed: HTTP ${response.status} ${responseText.slice(0, 500)}`);
+    }
+
+    const payload = record(parseMaybeJson(responseText));
+    const choices = Array.isArray(payload.choices) ? payload.choices : [];
+    const message = record(record(choices[0]).message);
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    const availableToolNames = new Set(tools.map((tool) => tool.function.name as BridgeToolName));
+    const decision = bridgeDecisionFromToolCall(toolCalls[0], availableToolNames);
+    if (decision) return decision;
+    const content = stringValue(message.content);
+    return content ? bridgeDecisionFromContent(content, availableToolNames) : { kind: 'reply', text: responseText };
+  }
+
+  private async structuredText(user: string, decisionSource: PendingUserDecisionSource): Promise<AssistantTextResult> {
+    const content = await this.chat([
+      { role: 'system', content: await this.assistantSystem() },
+      {
+        role: 'system',
+        content: [
+          'You are VibeCodingAssistant, the agent for a local AI coding workflow.',
+          'Your display name is VibeCodingAssistant. If asked your name, answer that you are VibeCodingAssistant; do not use provider names or generic assistant names.',
+          'Return JSON only with keys markdown, needsUserDecision, optional userPrompt, and optional userDecision.',
+          'Ask the user only for product, logic, cost, UX, scope, or direction decisions.',
+          'Never ask for low-level file/helper/test implementation permission.',
+          'When needsUserDecision=true, userDecision is REQUIRED and must contain question, rationale, options, and allowFreeform=true.',
+          'userDecision.options must contain 1 to 4 choices with ids A, B, C, D in order; each option needs label and impact.',
+          'If Architect, Reviewer, or VibeCodingAssistant recommends an option, include recommendedOptionId and recommendationReason. Do not invent a VibeCodingAssistant-side recommendation.',
+          'The user may answer with A/B/C/D or free-form instructions.',
+        ].join(' '),
+      },
+      { role: 'user', content: user },
+    ], true);
+    return assistantTextFromContent(content, decisionSource);
+  }
+
+  async decideBridgeAction(input: BridgeAgentInput): Promise<BridgeAgentDecision> {
+    return this.chatWithTools([
+      { role: 'system', content: await this.assistantSystem() },
+      {
+        role: 'system',
+        content: [
+          'You are VibeCodingAssistant, the user\'s personal AI work assistant and local coding workflow coordinator.',
+          'Understand the user\'s natural-language intent and choose exactly one available tool when a tool is needed.',
+          'There are two chat kinds. Control/Private Chat handles normal conversation, project management, and task scheduling. Project Chat is a long-lived group bound to one project; it may be idle or may have one active task.',
+          'When a Project Chat is idle, normal conversation should use reply_to_user and a clear task prompt should use create_task in the same group.',
+          'When a Project Chat has an active task, use only the active-task workflow tools that are available. Do not start a second task in that group.',
+          'If you do not call a tool, your text MUST NOT claim that anything was recorded, advanced, accepted, approved, stopped, started, routed, or fed back to the workflow. Plain replies are explanation, translation, Q&A, or clarification only.',
+          'If the user asks for an action that has no available tool in the current state, do not pretend to do it. Say plainly that you cannot execute it, name what you would have done, and list the available tools for the current state.',
+          'If task.status is `waiting_user_direction`, any reply that addresses the pending question, including an A/B/C/D option letter or a sentence explaining the choice, **MUST be sent via `answer_user_direction`**. Plain text is allowed only when you are genuinely asking the user a clarifying question back; in that case do not claim you will record, forward, or feed anything to the workflow.',
+          'When Control/Private Chat receives a task prompt, identify the project. If the project is unclear, ask a short clarification question. If the project is clear, use schedule_task_to_project_chat so VibeCodingAssistant can place it into an idle Project Chat.',
+          'If every Project Chat for a clear project is busy, explain that and ask whether to create a new Project Chat; do not auto-create one without user confirmation.',
+          'Use create_project_chat only after the user asks for a new Project Chat or confirms that they want one.',
+          'Use add_project only when the user provided a local targetDir. If targetDir is missing, ask for the project location. id, name, docsDir, and taskRecordRoot are optional.',
+          'Use list_projects when the user asks about registered projects, current project context, project paths, or available project groups.',
+          'Use switch_project only to set Control/Private Chat temporary project context; Project Chat project binding is fixed by its registration.',
+          'If the user asks what stage the task is in, whether it is stuck, why it is taking long, or whether it is still running, use show_status first. show_status can reveal the current live worker process, its role, and its latest stdout/stderr tail when available.',
+          'Only use show_artifact for artifacts listed in task.generatedArtifacts. If an artifact is not listed, explain that it has not been generated yet instead of trying to read it.',
+          'In particular, do not read implementation-log while the task is still implementing; it is created after the developer step finishes.',
+          'Do not narrate state-machine menus. If you cannot execute an action, explain the reason in plain language.',
+          'Context priority, highest first: real system state (chat, projectChatsSummary, task, runningJob, liveProcesses), chatSummary, recentMessages, retrievedMemory, latestUserMessage. If they conflict, real system state wins.',
+          'recentMessages is the short-term memory of the most recent turns in this exact chat (up to ~20). Use it to resolve short references like "现在创建吧", "继续", "两个都创建", or "刚才那个" by reading what you and the user just said.',
+          'chatSummary is mid-term memory; it captures earlier conversation that is no longer in recentMessages. Use it for context but never let it override the latest user message or current system state.',
+          'retrievedMemory is long-term memory pulled from project docs. Use it only for cross-task or cross-day background knowledge. Do not let it override what the user just said.',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: renderBridgeUserPrompt(input),
+      },
+    ], bridgeTools(input));
+  }
+
+  async decideNextAction(input: OrchestratorDecisionInput): Promise<OrchestratorDecision> {
+    const content = await this.chat([
+      { role: 'system', content: await this.assistantSystem() },
+      {
+        role: 'system',
+        content: [
+          '你是 VibeCodingAssistant 的 workflow advisor/orchestrator.',
+          '只能选择 allowedActions 内允许的 intent；action 只能是 respond, approve_implementation, forward_to_workflow, show_artifact, ask_clarification, wait_for_user.',
+          'awaiting_difficulty_selection 阶段，如果用户明确选择 low/medium/high/extra-high，返回 action=forward_to_workflow, intent=difficulty, difficulty=<level>. extra-high 表示 high 流程加 Planner/Reviewer 初始最多 3 轮；若仍有 blocking concerns，系统会询问用户是否再跑一轮。',
+          'awaiting_difficulty_selection 阶段不是表单监狱；如果用户在提问、吐槽、补充上下文、要求解释或表达想暂停/取消，就像助理一样理解并选择 respond、wait_for_user、ask_clarification 或合法的 stop，不要机械复读 low/medium/high/extra-high.',
+          'ready_for_decision 阶段，如果用户明确批准计划，返回 action=approve_implementation.',
+          '高风险动作 approve_implementation 以及 accept/reject/stop 要求 confidence >= 0.8.',
+          '只返回 JSON object。JSON keys: action, intent, difficulty, instruction, text, artifact, question, reason, reasoning, confidence, userConsentForContinuation.',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [
+          `当前任务状态:\n${JSON.stringify(input.state, null, 2)}`,
+          `当前允许动作:\n${JSON.stringify(input.allowedActions, null, 2)}`,
+          `requestedChanges:\n${JSON.stringify(input.requestedChanges, null, 2)}`,
+          `recentDecisionLog:\n${input.recentDecisionLog}`,
+          input.latestArtifactName ? `latestArtifactName: ${input.latestArtifactName}` : undefined,
+          input.ruleHint ? `ruleHint:\n${JSON.stringify(input.ruleHint, null, 2)}` : undefined,
+          input.previousActionInThisTurn ? `previousActionInThisTurn:\n${JSON.stringify(input.previousActionInThisTurn, null, 2)}` : undefined,
+          input.rejectionReason ? `上一次决策被拒绝，原因:\n${input.rejectionReason}` : undefined,
+          `用户消息:\n${input.latestUserMessage}`,
+        ].filter(Boolean).join('\n\n'),
+      },
+    ], true);
+    return orchestratorDecisionFromContent(content);
+  }
+
+  async classifyIntent(input: {
+    userMessage: string;
+    state: TaskState;
+    allowedActions: AllowedAction[];
+    recentContext: string;
+    config: AssistantConfig;
+  }): Promise<IntentResult> {
+    const content = await this.chat([
+      { role: 'system', content: await this.assistantSystem() },
+      {
+        role: 'system',
+        content: [
+          '你是 VibeCodingAssistant 工作流的对话意图分类器。',
+          '状态机负责流程正确性；你只负责理解用户自然语言。',
+          '只返回 JSON object，不要输出 markdown。',
+          'JSON keys: intent, difficulty, instruction, note, artifact, confidence, requiresClarification, userFacingInterpretation.',
+          'intent 必须是 allowedActions 里的 id；如果无法判断，用 unknown。',
+          '如果 allowedActions 里有 ask，而用户是在提问、聊天、吐槽、补充上下文或要求解释，不要用 unknown；用 ask。等待难度选择时也一样，不能把这个阶段当成只接受 low/medium/high/extra-high 的表单。',
+          'difficulty 只在 intent=difficulty 时填写 low、medium、high 或 extra-high。extra-high 表示 high 流程加 Planner/Reviewer 初始最多 3 轮；之后每一轮都需要用户确认。',
+          'instruction 可以跟随任何会推动 workflow 的 intent，用来保留用户给后续 agent 的约束、原文使用要求、范围边界或修改要求；不要丢掉这些信息。',
+          'note 只在 intent=note 时填写备注。',
+          'artifact 可在用户要求查看、发送、解释或使用某个产物时填写；可选值包括 original-task、revised-plan、agent-prompts、agent-prompt-preview、final-report 等。',
+          '如果用户想看“准备发给 Architect/Codex/Claude 的 prompt”，artifact 填 agent-prompt-preview，intent 通常填 ask。',
+          '如果用户要求“直接用我原来的 prompt / 原封不动交给 Architect / 不要重写”，把这条要求原样写进 instruction；当前流程不再改写用户 prompt。',
+          'confidence 是 0 到 1。',
+          'requiresClarification=true 表示需要先问清楚，不能推动 workflow。',
+          'userFacingInterpretation 必须是简短自然中文，用来告诉用户你理解成了什么。',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [
+          `当前任务状态:\n${JSON.stringify({
+            taskId: input.state.taskId,
+            title: input.state.title,
+            status: input.state.status,
+            difficulty: input.state.difficulty,
+            pendingUserPrompt: input.state.pendingUserPrompt,
+            revisionRound: input.state.revisionRound,
+            reviewerRunCount: input.state.reviewerRunCount,
+          }, null, 2)}`,
+          `当前允许动作:\n${JSON.stringify(input.allowedActions, null, 2)}`,
+          `最近上下文:\n${input.recentContext}`,
+          `用户消息:\n${input.userMessage}`,
+        ].join('\n\n'),
+      },
+    ], true);
+    return intentResultFromContent(content);
+  }
+
+  async composeReply(input: {
+    rawMessage: string;
+    state: TaskState;
+    pendingPrompt?: string;
+    userQuestion?: string;
+    config: AssistantConfig;
+  }): Promise<ComposedReply> {
+    const content = await this.chat([
+      { role: 'system', content: await this.assistantSystem() },
+      {
+        role: 'system',
+        content: [
+          '你是 VibeCodingAssistant 的中文回复润色器。',
+          '把 raw workflow result 改写成自然、简洁、中文优先的聊天回复。',
+          '不要 dump Task ID / Status / Pending 这种状态块。',
+          '不要暴露英文路由词或类似 "User explicitly selected" 的内部措辞。',
+          '可以保留必要的 artifact 名称、命令名和英文技术名。',
+          '必须尊重 workflow gate：如果状态在等待用户，就清楚告诉用户下一步能怎么说。',
+          '不要声称状态机没有做过的事。',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [
+          `任务状态:\n${JSON.stringify({
+            title: input.state.title,
+            status: input.state.status,
+            difficulty: input.state.difficulty,
+            pendingUserPrompt: input.pendingPrompt ?? input.state.pendingUserPrompt,
+            revisionRound: input.state.revisionRound,
+            reviewerRunCount: input.state.reviewerRunCount,
+          }, null, 2)}`,
+          input.userQuestion ? `用户问题:\n${input.userQuestion}` : undefined,
+          `Raw workflow result:\n${input.rawMessage}`,
+        ].filter(Boolean).join('\n\n'),
+      },
+    ]);
+    return { text: content.trim() || input.rawMessage };
+  }
+
+  createRevisionInstructions(input: {
+    task: string;
+    projectContext: string;
+    initialPlan: string;
+    review: string;
+    requestedChanges: string[];
+    state: TaskState;
+    config: AssistantConfig;
+  }): Promise<AssistantTextResult> {
+    const hasUserChanges = input.requestedChanges.length > 0;
+    const priorityNote = hasUserChanges
+      ? 'The user has provided requested changes via revise C. These user changes take PRIORITY and must drive the revision instructions. Reviewer feedback is secondary reference; only include it where it does not conflict with user changes. If reviewer feedback contradicts user changes, follow the user. Do not preserve the original plan structure where user changes override it.'
+      : 'Turn the Reviewer feedback into concise revision instructions for the Planner Agent.';
+    return this.structuredText([
+      priorityNote,
+      'Do not ask the user unless there is a product/direction-level decision that the user has not already answered.',
+      'If you need a user decision, provide userDecision with A/B/C/D structured options and include any VibeCodingAssistant recommendation with its explanation.',
+      `Project context:\n${input.projectContext}`,
+      `Task:\n${input.task}`,
+      `Initial plan:\n${input.initialPlan}`,
+      `Reviewer feedback:\n${input.review}`,
+      `User requested changes (PRIORITY when present):\n${input.requestedChanges.join('\n\n') || 'none'}`,
+    ].join('\n\n'), 'plan_revision');
+  }
+
+  async explainRevisedPlan(input: {
+    task: string;
+    projectContext: string;
+    revisedPlan: string;
+    review: string;
+    state: TaskState;
+    config: AssistantConfig;
+  }): Promise<AssistantTextResult> {
+    const plainLanguageSkill = await loadAssistantSkill('plain-language-explanation');
+    return this.structuredText([
+      plainLanguageSkill,
+      'Explain the revised plan to the user in plain language.',
+      'Explain what the plan tries to do, why it flows logically, practical meaning of important technical choices, what the reviewer objected to, and how the revision addressed it.',
+      'This explanation is informational only. Do not set needsUserDecision or ask the user for a planning decision here.',
+      `Project context:\n${input.projectContext}`,
+      `Task:\n${input.task}`,
+      `Reviewer feedback:\n${input.review}`,
+      `Revised plan:\n${input.revisedPlan}`,
+    ].filter(Boolean).join('\n\n'), 'plan_explanation');
+  }
+
+  async answerQuestion(input: { question: string; context: string; projectContext: string; state: TaskState; config: AssistantConfig }): Promise<string> {
+    return this.chat([
+      { role: 'system', content: await this.assistantSystem() },
+      {
+        role: 'system',
+        content: [
+          'Answer as VibeCodingAssistant using only the provided project, task, plan, review, Q&A, and decision context.',
+          'Your display name is VibeCodingAssistant. If asked your name, answer that you are VibeCodingAssistant; do not use provider names or generic assistant names.',
+          'Keep the answer clear and practical.',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [`Question: ${input.question}`, `Project context:\n${input.projectContext}`, input.context].join('\n\n'),
+      },
+    ]);
+  }
+
+  async interpretAmbiguousReply(input: { reply: string; context: string; state: TaskState; config: AssistantConfig }): Promise<string> {
+    return this.chat([
+      { role: 'system', content: await this.assistantSystem() },
+      {
+        role: 'system',
+        content: 'Interpret the user reply as approve, reject, revise, stop, status, summary, or unclear. Do not execute anything. Ask for explicit confirmation in one sentence.',
+      },
+      {
+        role: 'user',
+        content: [`Reply: ${input.reply}`, input.context].join('\n\n'),
+      },
+    ]);
+  }
+
+  async handleControlChat(input: {
+    message: string;
+    pendingProposal?: TaskProposal;
+    mode: 'message' | 'edit';
+    projectContext: string;
+    config: AssistantConfig;
+  }): Promise<ControlChatResult> {
+    const content = await this.chat([
+      { role: 'system', content: await this.assistantSystem() },
+      {
+        role: 'system',
+        content: [
+          '你是未绑定 Lark control chat 里的 VibeCodingAssistant。',
+          '如果用户问你是谁，回答你是 VibeCodingAssistant；不要使用供应商名字或泛泛的 assistant 名称。',
+          '你首先是一个正常聊天助手：可以回答问题、解释概念、帮用户思考，也可以在用户要求时整理 prompt。',
+          '默认使用简体中文回复。即使用户消息、prompt 或规格文档是英文，所有用户可见的解释、标签、确认语、下一步提示都必须是中文。',
+          '可以保留必要的代码、命令、文件名、库名、产品名、英文原文片段；但不要用英文模板包装回复。',
+          '用户可见 JSON 字段包括 markdown、proposal.interpretedIntent、proposal.title、proposal.task、proposal.wouldDo、proposal.wouldNotDo、proposal.suggestedNextAction，全部优先写中文。',
+          '不要输出 "Based on your detailed specification"、"Intent"、"Suggested task prompt"、"Would do"、"Would not do"、"Suggested next action"、"Reply create task, edit, or cancel" 这类英文话术。',
+          '使用提供的 project context 回答项目相关问题；如果 context 不足，就说检索到的上下文不够，不要声称直接读过文件系统。',
+          '绝对不要创建或启动真实任务；你只能提出一份待确认的任务草案。',
+          '只返回 JSON。',
+          'Allowed kind values: answer, proposal, confirm_pending_proposal, cancel_pending_proposal, clarify.',
+          '普通聊天或 prompt 整理返回 {"kind":"answer","markdown":"中文回复"}；除非用户明确描述了要交给 workflow 做的未来任务，否则不要创建 proposal。',
+          '没有 pending proposal 时，不要把长 prompt 里的 confirm/create task/edit/cancel 当命令；正常回答，或仅在用户明确要 workflow 处理时创建 proposal。',
+          '有 pending proposal 且用户明确想创建/确认时，返回 {"kind":"confirm_pending_proposal","markdown":"简短中文确认"}。',
+          '有 pending proposal 且用户想取消时，返回 {"kind":"cancel_pending_proposal","markdown":"简短中文确认"}。',
+          '有 pending proposal 且用户要求修改时，返回修订后的 {"kind":"proposal",...}。',
+          '可能的 workflow 任务返回 {"kind":"proposal","markdown":"可选中文引导","proposal":{"interpretedIntent":"中文理解","title":"中文短标题","task":"中文任务内容；必要时保留英文技术名词或原文","wouldDo":["中文"],"wouldNotDo":["中文"],"suggestedNextAction":"可以说「创建任务」确认，或继续补充修改。"}}。',
+          '意图不清楚时返回 {"kind":"clarify","markdown":"一个简短中文澄清问题"}。',
+          '如果用户说不要创建任务、不要执行，或只是要 prompt，返回 kind=answer。',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [
+          `Mode: ${input.mode}`,
+          `Target workspace: ${input.config.workspace.targetDir}`,
+          `Project context:\n${input.projectContext}`,
+          input.pendingProposal ? `Pending proposal:\n${JSON.stringify(input.pendingProposal, null, 2)}` : 'Pending proposal: none',
+          `User message:\n${input.message}`,
+        ].join('\n\n'),
+      },
+    ], true);
+    return controlChatFromContent(content);
+  }
+
+  async routeAfterFinalReview(input: {
+    finalReview: string;
+    verificationLog: string;
+    state: TaskState;
+    config: AssistantConfig;
+  }): Promise<AssistantRouteResult> {
+    const content = await this.chat([
+      { role: 'system', content: await this.assistantSystem() },
+      {
+        role: 'system',
+        content: [
+          'You route after final review.',
+          'Return JSON only: {"route":"complete|route_to_implementer|route_to_planner|ask_user_direction","reason":"...","userPrompt":"optional","userDecision":"required only when route is ask_user_direction"}',
+          'Route to implementer for contained implementation defects, planner for plan/design mismatch, ask user for product/scope/direction decisions.',
+          'If route=ask_user_direction, userDecision is REQUIRED with question, rationale, 1 to 4 A/B/C/D options, allowFreeform=true, and any recommendation explanation from the advisor.',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [`Final review:\n${input.finalReview}`, `Verification:\n${input.verificationLog}`].join('\n\n'),
+      },
+    ], true);
+    return routeFromContent(content);
+  }
+}
+
+export class StubHeavyAgentAdapter implements HeavyAgentAdapter {
+  async createInitialPlan(input: { task: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig }): Promise<PlanResult> {
+    return {
+      markdown: [
+        '# Initial Plan',
+        '',
+        'This is a stub planner artifact. Enable `--allow-agent-calls` to call the configured Planner Agent.',
+        '',
+        '## Authoritative User Prompt',
+        input.task,
+        '',
+        '## Proposed Verification',
+        '- npm test',
+      ].join('\n'),
+      verificationCommands: ['npm test'],
+    };
+  }
+
+  async reviewPlan(input: { difficulty: WorkflowDifficulty }): Promise<ReviewResult> {
+    const usesLedger = usesBlockerLedger(input.difficulty);
+    return {
+      markdown: [
+        '# Reviewer Feedback',
+        '',
+        'Stub reviewer: no blocking issues found. Enable `--allow-agent-calls` for the configured Reviewer Agent.',
+      ].join('\n'),
+      ...(usesLedger ? {
+        reviewerBlockerOutput: {
+          blockers: [],
+          previousVerdicts: [],
+        },
+      } : {}),
+    };
+  }
+
+  async revisePlan(input: {
+    task: string;
+    initialPlan: string;
+    review: string;
+    requestedChanges: string[];
+    difficulty: WorkflowDifficulty;
+    state: TaskState;
+    config: AssistantConfig;
+    blockerLedgerText?: string;
+  }): Promise<PlanResult> {
+    return {
+      markdown: [
+        '# Revised Plan',
+        '',
+        'This is a stub revised plan created from the authoritative Reviewer feedback and user-requested changes.',
+        '',
+        '## Reviewer Feedback',
+        input.review,
+        '',
+        '## User Requested Changes',
+        input.requestedChanges.join('\n\n') || 'none',
+        '',
+        '## Verification Commands',
+        '- npm test',
+      ].join('\n'),
+      verificationCommands: ['npm test'],
+    };
+  }
+
+  async implement(input?: { mode?: ImplementationMode }): Promise<ImplementationResult> {
+    return {
+      markdown: [
+        '# Implementation Log',
+        '',
+        input?.mode === 'final_review_followup'
+          ? 'Stub implementer ran a Final Review Follow-up scoped implementation.'
+          : 'Stub implementer ran the approved execution unit.',
+        '',
+        'Stub implementer did not modify the target workspace. Enable `--allow-agent-calls` to call the configured Implementer Agent.',
+      ].join('\n'),
+      changedFiles: [],
+    };
+  }
+
+  async finalReview(): Promise<FinalReviewResult> {
+    return {
+      markdown: [
+        '# Final Review',
+        '',
+        'Stub final reviewer found no blocking issues. Enable `--allow-agent-calls` to call the configured Final Reviewer Agent.',
+      ].join('\n'),
+      passed: true,
+    };
+  }
+}
+
+export function buildInitialPlanPrompt(input: {
+  task: string;
+  projectContext: string;
+  difficulty: WorkflowDifficulty;
+  state: Pick<TaskState, 'requestedChanges'>;
+}): string {
+  return [
+    'Act as the Architect. Create an initial implementation plan. Do not edit files.',
+    'Every approved plan is one parent task. If decomposition is useful, describe execution units; otherwise treat it as one execution unit.',
+    'When you decompose, format each execution unit as its own Markdown heading exactly like: "## Execution Unit 01: <name>".',
+    'Do not use only a numbered list under "Execution units" for decomposed plans; VibeCodingAssistant can read the heading format reliably.',
+    'Suggest exactly one lightweight Category if obvious. Supported categories are: Reader Core, Selection / Popup, Vocabulary Algorithm, Translation / LLM, Feedback / User Model, Storage / Persistence, Backend / API, Data / Dictionary Pipeline, Evaluation / Benchmark, Assistant / Workflow, Docs / Task Record, UI / Frontend, Other.',
+    'Do not create category folders or tags.',
+    `Workflow difficulty: ${input.difficulty}`,
+    `Project context:\n${input.projectContext}`,
+    'Planning input mode: authoritative original prompt',
+    'Reason: VibeCodingAssistant no longer rewrites or ranks the user prompt. The original user prompt is always the planning source of truth.',
+    `AUTHORITATIVE USER PROMPT, VERBATIM:\n${input.task}`,
+    `User workflow directives and requested changes:\n${input.state.requestedChanges.join('\n\n') || 'none'}`,
+    'When user workflow directives conflict with anything else, follow the user workflow directives.',
+    'Priority order: explicit user workflow directives > authoritative user prompt > current code/project context.',
+    architectDecisionProtocolPrompt(),
+    'End with a "Verification Commands" section listing only commands to run.',
+  ].join('\n\n');
+}
+
+function architectDecisionProtocolPrompt(): string {
+  return [
+    'User decision protocol:',
+    'If a product, scope, UX, cost, or direction decision is required before writing a usable plan, do not guess and do not pick for the user.',
+    'Instead, include exactly one fenced JSON block with language `assistant-user-decision` containing question, rationale, 1 to 4 options with label and impact, and optional recommendedOptionId plus recommendationReason.',
+    'If no user decision is required, do not include an assistant-user-decision block.',
+    'Output contract: return the full plan markdown directly in your final stdout response. Do not only say "Plan written to <path>". Do not rely on provider-specific plan files.',
+  ].join('\n');
+}
+
+function reviewerDecisionProtocolPrompt(): string {
+  return [
+    'Reviewer decision protocol:',
+    'Your review markdown is authoritative feedback for the Architect.',
+    'Only if a product, scope, UX, cost, or direction decision must be made by the user, include exactly one fenced JSON block with language `assistant-user-decision` containing question, rationale, 1 to 4 options with label and impact, and optional recommendedOptionId plus recommendationReason.',
+    'Do not ask the user for purely technical fixes, missing tests, implementation risks, or plan quality issues; write those directly in the review.',
+    'Output contract: return the full review markdown directly in your final stdout response. Do not only say "Plan written to <path>". Do not rely on provider-specific plan files.',
+  ].join('\n');
+}
+
+function reviewerBlockerProtocolPrompt(difficulty: WorkflowDifficulty, ledgerText: string): string {
+  const isExtraHigh = difficulty === 'extra-high';
+  return [
+    'Blocker ledger protocol:',
+    'Because this is high or extra-high planning, you MUST include exactly one fenced JSON block with language `reviewer-blockers`.',
+    'Use this schema: {"blockers":[{"id":"B1","severity":"blocker|high|medium","category":"design|test|scope|risk|ambiguity|other","title":"short title","detail":"why this blocks or risks the plan and what must change","verifyHint":"how the Architect can prove it was fixed"}],"previousBlockerVerdicts":[{"id":"B1","verdict":"closed|still_open|changed","reason":"why"}]}.',
+    'If there are no blockers, output `"blockers": []`.',
+    isExtraHigh
+      ? 'For the first ledger review, previousBlockerVerdicts MUST be []. For later reviews, previousBlockerVerdicts MUST cover every active prior blocker from the ledger context. Use closed only when the latest plan truly resolves it; use still_open if it remains; use changed only when you update the same blocker id and include that id in blockers with updated fields.'
+      : 'For high planning, this is a single-pass ledger. previousBlockerVerdicts should be [] unless VibeCodingAssistant provides an active prior ledger.',
+    'New blocker ids must look like B1, B2, B3 and must be greater than any existing blocker id. Do not renumber existing blockers.',
+    'Do not repeat still_open blockers in blockers; VibeCodingAssistant carries them forward automatically. If changed, repeat the same id in blockers with updated detail.',
+    'Ledger context for this review:',
+    ledgerText,
+  ].join('\n');
+}
+
+function architectBlockerResponseProtocolPrompt(ledgerText: string): string {
+  return [
+    'Architect blocker response protocol:',
+    'If the ledger context below contains active blockers, you MUST include exactly one fenced JSON block with language `architect-blocker-responses`.',
+    'Use this schema: {"responses":[{"id":"B1","status":"addressed|partially_addressed|needs_user_decision|rejected","summary":"how the revised plan handles this blocker","planAnchor":"heading, Execution Unit, or section where the plan reflects this","rejectionReason":"only when status is rejected"}]}.',
+    'Responses must cover every active blocker id in the ledger context. Do not invent new blocker ids; only Reviewer creates blockers.',
+    'planAnchor is required for addressed and partially_addressed. rejectionReason is required for rejected.',
+    'If status is needs_user_decision, also include the existing assistant-user-decision fenced JSON block in the same output.',
+    'If the ledger context says there are no active blockers, do not include architect-blocker-responses.',
+    'Active blocker ledger context:',
+    ledgerText,
+  ].join('\n');
+}
+
+export function buildRevisedPlanPrompt(input: {
+  task: string;
+  projectContext: string;
+  initialPlan: string;
+  review: string;
+  requestedChanges: string[];
+  difficulty: WorkflowDifficulty;
+  blockerLedgerText?: string;
+}): string {
+  return [
+    'Act as the Architect. Create the revised plan. Do not edit files.',
+    'Every approved plan is one parent task. If decomposition is useful, describe execution units; otherwise treat it as one execution unit.',
+    'When you decompose, format each execution unit as its own Markdown heading exactly like: "## Execution Unit 01: <name>".',
+    'Do not use only a numbered list under "Execution units" for decomposed plans; VibeCodingAssistant can read the heading format reliably.',
+    'Suggest exactly one lightweight Category if obvious. Use Other when unsure. Do not create category folders or tags.',
+    `Workflow difficulty: ${input.difficulty}`,
+    `Project context:\n${input.projectContext}`,
+    `Task:\n${input.task}`,
+    `Initial plan:\n${input.initialPlan}`,
+    `Reviewer feedback (authoritative; source of truth for what to change):\n${input.review}`,
+    usesBlockerLedger(input.difficulty) ? architectBlockerResponseProtocolPrompt(input.blockerLedgerText ?? '(no active blockers)') : undefined,
+    `User workflow directives and requested changes (authoritative):\n${input.requestedChanges.join('\n\n') || 'none'}`,
+    architectDecisionProtocolPrompt(),
+    'End with a "Verification Commands" section listing only commands to run.',
+  ].filter((part): part is string => part !== undefined).join('\n\n');
+}
+
+export function buildReviewPlanPrompt(input: {
+  task: string;
+  projectContext: string;
+  initialPlan: string;
+  difficulty: WorkflowDifficulty;
+  blockerLedgerText?: string;
+}): string {
+  return [
+    'Act as the Plan Reviewer. Review this initial plan once. Focus on blocking bugs, risks, missing tests, product-impacting ambiguity, and whether any proposed execution-unit breakdown is coherent.',
+    `Workflow difficulty: ${input.difficulty}`,
+    `Project context:\n${input.projectContext}`,
+    `Task:\n${input.task}`,
+    `Initial plan:\n${input.initialPlan}`,
+    usesBlockerLedger(input.difficulty) ? reviewerBlockerProtocolPrompt(input.difficulty, input.blockerLedgerText ?? '(no prior blockers; this is the first ledger review)') : undefined,
+    reviewerDecisionProtocolPrompt(),
+  ].filter((part): part is string => part !== undefined).join('\n\n');
+}
+
+export function usesBlockerLedger(difficulty: WorkflowDifficulty): boolean {
+  return difficulty === 'high' || difficulty === 'extra-high';
+}
+
+export function buildCodexProfileArgs(profile: AgentProfileConfig | undefined): string[] {
+  const args: string[] = [];
+  if (profile?.model) {
+    args.push('--model', profile.model);
+  }
+  if (profile?.effort) {
+    args.push('-c', `model_reasoning_effort=${JSON.stringify(profile.effort)}`);
+  }
+  return args;
+}
+
+export function buildClaudeProfileArgs(profile: AgentProfileConfig | undefined): string[] {
+  const args: string[] = [];
+  if (profile?.model) {
+    args.push('--model', profile.model);
+  }
+  if (profile?.effort) {
+    args.push('--effort', profile.effort);
+  }
+  return args;
+}
+
+function profileProviderKey(profile: AgentProfileConfig): string {
+  return (profile.provider ?? profile.kind).trim().toLowerCase();
+}
+
+function requireProfileCommand(
+  profileName: string,
+  role: HeavyWorkflowRoleName,
+  profile: AgentProfileConfig,
+): string {
+  const command = profile.command?.trim();
+  if (command) return command;
+  throw new Error(`Workflow role ${role} uses profile "${profileName}", but profiles.${profileName}.command is missing.`);
+}
+
+export function codexSandboxForWorkflowRole(role: HeavyWorkflowRoleName): 'danger-full-access' | 'workspace-write' | 'read-only' {
+  if (role === 'developer') return 'danger-full-access';
+  if (role === 'finalReviewer') return 'workspace-write';
+  return 'read-only';
+}
+
+export function claudePermissionModeForWorkflowRole(role: HeavyWorkflowRoleName): 'bypassPermissions' | 'default' {
+  return role === 'architect' || role === 'planReviewer' ? 'default' : 'bypassPermissions';
+}
+
+export function claudeAllowedToolsForWorkflowRole(role: HeavyWorkflowRoleName): string[] {
+  return role === 'architect' || role === 'planReviewer'
+    ? ['Read', 'Grep', 'Glob', 'LS']
+    : [];
+}
+
+export class HeavyAgentArtifactError extends Error {
+  readonly sourcePath?: string;
+
+  constructor(message: string, options: { sourcePath?: string } = {}) {
+    super(message);
+    this.name = 'HeavyAgentArtifactError';
+    if (options.sourcePath) this.sourcePath = options.sourcePath;
+  }
+}
+
+interface HeavyAgentMarkdownResult {
+  markdown: string;
+  sourcePath?: string;
+  stdoutSummary?: string;
+}
+
+export function parseAgentDecisionMarkdown(
+  markdown: string,
+  source: PendingUserDecisionSource,
+): Pick<PlanResult, 'markdown' | 'userDecision' | 'decisionParseError'> {
+  const parsed = parseUserDecisionBlock(markdown, source);
+  if (!parsed) return { markdown };
+  if (!parsed.ok) {
+    return {
+      markdown,
+      decisionParseError: parsed.error,
+    };
+  }
+  return {
+    markdown: parsed.result.strippedMarkdown,
+    userDecision: parsed.result.decision,
+  };
+}
+
+export function parseAgentReviewerBlockerMarkdown(
+  markdown: string,
+): Pick<ReviewResult, 'markdown' | 'reviewerBlockerOutput' | 'blockerLedgerParseError'> {
+  const parsed = parseReviewerBlockerBlock(markdown);
+  if (!parsed) return { markdown };
+  if (!parsed.ok) {
+    return {
+      markdown: parsed.strippedMarkdown,
+      blockerLedgerParseError: parsed.error,
+    };
+  }
+  return {
+    markdown: parsed.strippedMarkdown,
+    reviewerBlockerOutput: parsed.output,
+  };
+}
+
+export function parseAgentArchitectBlockerResponseMarkdown(
+  markdown: string,
+): Pick<PlanResult, 'markdown' | 'architectBlockerResponses' | 'blockerResponseParseError'> {
+  const parsed = parseArchitectResponsesBlock(markdown);
+  if (!parsed) return { markdown };
+  if (!parsed.ok) {
+    return {
+      markdown: parsed.strippedMarkdown,
+      blockerResponseParseError: parsed.error,
+    };
+  }
+  return {
+    markdown: parsed.strippedMarkdown,
+    architectBlockerResponses: parsed.responses,
+  };
+}
+
+const CLAUDE_PLAN_PATH_REGEX = /Plan written to\s+`?([^\r\n`]+?\.md)`?\.?/i;
+
+function commandOutputErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function combineCommandOutput(result: RunResult): string {
+  return [result.stdout, result.stderr]
+    .map((part) => sanitizeTextForArtifact(part).trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+export async function resolveHeavyAgentMarkdownFromOutput(
+  result: RunResult,
+  options: {
+    kind: 'claude' | 'codex' | 'generic';
+    outputPath?: string;
+  },
+): Promise<HeavyAgentMarkdownResult> {
+  const combined = combineCommandOutput(result);
+
+  if (options.kind === 'codex' && options.outputPath) {
+    const body = sanitizeTextForArtifact(await readFile(options.outputPath, 'utf8').catch(() => '')).trim();
+    if (body) {
+      return {
+        markdown: body,
+        sourcePath: options.outputPath,
+        ...(combined ? { stdoutSummary: combined } : {}),
+      };
+    }
+  }
+
+  if (options.kind === 'claude') {
+    const match = combined.match(CLAUDE_PLAN_PATH_REGEX);
+    const sourcePath = match?.[1]?.trim();
+    if (sourcePath) {
+      const matchedText = match?.[0] ?? '';
+      const fileBody = await readFile(sourcePath, 'utf8').catch((error: unknown) => {
+        throw new HeavyAgentArtifactError(
+          `Claude reported plan at ${sourcePath} but the file is not readable: ${commandOutputErrorMessage(error)}`,
+          { sourcePath },
+        );
+      });
+      const stdoutSummary = combined.replace(matchedText, '').trim();
+      return {
+        markdown: sanitizeTextForArtifact(fileBody).trim(),
+        sourcePath,
+        ...(stdoutSummary ? { stdoutSummary } : {}),
+      };
+    }
+
+  }
+
+  return { markdown: combined };
+}
+
+class CliHeavyAgentAdapter implements HeavyAgentAdapter {
+  constructor(private readonly config: AssistantConfig) {}
+
+  private async codex(
+    prompt: string,
+    profileName: string,
+    role: HeavyWorkflowRoleName,
+    profile: AgentProfileConfig,
+    taskId: string,
+    config = this.config,
+  ): Promise<HeavyAgentMarkdownResult> {
+    const command = requireProfileCommand(profileName, role, profile);
+    const sandbox = codexSandboxForWorkflowRole(role);
+    const outputDir = await mkdtemp(join(tmpdir(), 'assistant-codex-'));
+    const outputPath = join(outputDir, 'last-message.md');
+    try {
+      const result = await runFile(command, [
+        '-a',
+        'never',
+        'exec',
+        ...buildCodexProfileArgs(profile),
+        '--color',
+        'never',
+        '--output-last-message',
+        outputPath,
+        '-C',
+        config.workspace.targetDir,
+        '--sandbox',
+        sandbox,
+        '--skip-git-repo-check',
+        '-',
+      ], config.workspace.targetDir, prompt, {
+        taskId,
+        role,
+        profileName,
+        label: `${role}:${profileName}`,
+        outputPath,
+      });
+      return resolveHeavyAgentMarkdownFromOutput(result, { kind: 'codex', outputPath });
+    } finally {
+      await rm(outputDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  private async claude(
+    prompt: string,
+    profileName: string,
+    role: HeavyWorkflowRoleName,
+    profile: AgentProfileConfig,
+    taskId: string,
+    config = this.config,
+  ): Promise<HeavyAgentMarkdownResult> {
+    const command = requireProfileCommand(profileName, role, profile);
+    const permissionMode = claudePermissionModeForWorkflowRole(role);
+    const allowedTools = claudeAllowedToolsForWorkflowRole(role);
+    const result = await runFile(command, [
+      '-p',
+      ...buildClaudeProfileArgs(profile),
+      '--permission-mode',
+      permissionMode,
+      ...(allowedTools.length > 0 ? ['--allowedTools', allowedTools.join(',')] : []),
+      '--add-dir',
+      config.workspace.targetDir,
+    ], config.workspace.targetDir, prompt, {
+      taskId,
+      role,
+      profileName,
+      label: `${role}:${profileName}`,
+    });
+    return resolveHeavyAgentMarkdownFromOutput(result, { kind: 'claude' });
+  }
+
+  private async genericCommand(
+    prompt: string,
+    profileName: string,
+    role: HeavyWorkflowRoleName,
+    profile: AgentProfileConfig,
+    taskId: string,
+    config = this.config,
+  ): Promise<HeavyAgentMarkdownResult> {
+    const command = requireProfileCommand(profileName, role, profile);
+    const result = await runFile(command, [], config.workspace.targetDir, prompt, {
+      taskId,
+      role,
+      profileName,
+      label: `${role}:${profileName}`,
+    });
+    return resolveHeavyAgentMarkdownFromOutput(result, { kind: 'generic' });
+  }
+
+  private runWorkflowRole(
+    prompt: string,
+    difficulty: WorkflowDifficulty,
+    role: HeavyWorkflowRoleName,
+    config: AssistantConfig,
+    state: Pick<TaskState, 'taskId'>,
+  ): Promise<HeavyAgentMarkdownResult> {
+    const profileName = config.workflowRoles[difficulty][role];
+    const profile = config.profiles[profileName];
+    if (!profile) {
+      throw new Error(`Workflow role ${difficulty}.${role} references missing profile ${profileName}.`);
+    }
+    if (!isCommandBackedProfile(profile)) {
+      throw new Error(`Workflow role ${difficulty}.${role} uses profile "${profileName}", but workflow agents require a command-backed profile.`);
+    }
+    const providerKey = profileProviderKey(profile);
+    if (providerKey === 'codex') {
+      return this.codex(prompt, profileName, role, profile, state.taskId, config);
+    }
+    if (providerKey === 'claude') {
+      return this.claude(prompt, profileName, role, profile, state.taskId, config);
+    }
+    return this.genericCommand(prompt, profileName, role, profile, state.taskId, config);
+  }
+
+  private agentPromptRecord(
+    prompt: string,
+    difficulty: WorkflowDifficulty,
+    role: HeavyWorkflowRoleName,
+    state: TaskState,
+    config: AssistantConfig,
+  ): AgentPromptRecord {
+    const profileName = config.workflowRoles[difficulty][role];
+    const profile = config.profiles[profileName];
+    if (!profile) {
+      throw new Error(`Workflow role ${difficulty}.${role} references missing profile ${profileName}.`);
+    }
+    return {
+      taskId: state.taskId,
+      role,
+      difficulty,
+      profileName,
+      profileKind: profile.kind,
+      ...(profile.model ? { model: profile.model } : {}),
+      ...(profile.effort ? { effort: profile.effort } : {}),
+      createdAt: new Date().toISOString(),
+      prompt,
+    };
+  }
+
+  async createInitialPlan(input: { task: string; projectContext: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig }): Promise<PlanResult> {
+    const prompt = buildInitialPlanPrompt(input);
+    const output = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config, input.state);
+    const parsed = parseAgentDecisionMarkdown(output.markdown, 'architect_plan');
+    return {
+      markdown: parsed.markdown,
+      verificationCommands: extractVerificationCommands(parsed.markdown),
+      planPackDraft: extractPlanPackDraft(parsed.markdown),
+      agentPrompt: this.agentPromptRecord(prompt, input.difficulty, 'architect', input.state, input.config),
+      ...(output.sourcePath ? { sourcePath: output.sourcePath } : {}),
+      ...(output.stdoutSummary ? { stdoutSummary: output.stdoutSummary } : {}),
+      ...(parsed.userDecision ? { userDecision: parsed.userDecision } : {}),
+      ...(parsed.decisionParseError ? { decisionParseError: parsed.decisionParseError } : {}),
+    };
+  }
+
+  async reviewPlan(input: { task: string; projectContext: string; initialPlan: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig; blockerLedgerText?: string }): Promise<ReviewResult> {
+    const prompt = buildReviewPlanPrompt(input);
+    const output = await this.runWorkflowRole(prompt, input.difficulty, 'planReviewer', input.config, input.state);
+    const decisionParsed = parseAgentDecisionMarkdown(output.markdown, 'plan_review');
+    const ledgerParsed = parseAgentReviewerBlockerMarkdown(decisionParsed.markdown);
+    return {
+      markdown: ledgerParsed.markdown,
+      agentPrompt: this.agentPromptRecord(prompt, input.difficulty, 'planReviewer', input.state, input.config),
+      ...(output.sourcePath ? { sourcePath: output.sourcePath } : {}),
+      ...(output.stdoutSummary ? { stdoutSummary: output.stdoutSummary } : {}),
+      ...(decisionParsed.userDecision ? { userDecision: decisionParsed.userDecision } : {}),
+      ...(decisionParsed.decisionParseError ? { decisionParseError: decisionParsed.decisionParseError } : {}),
+      ...(ledgerParsed.reviewerBlockerOutput ? { reviewerBlockerOutput: ledgerParsed.reviewerBlockerOutput } : {}),
+      ...(ledgerParsed.blockerLedgerParseError ? { blockerLedgerParseError: ledgerParsed.blockerLedgerParseError } : {}),
+    };
+  }
+
+  async revisePlan(input: {
+    task: string;
+    projectContext: string;
+    initialPlan: string;
+    review: string;
+    requestedChanges: string[];
+    difficulty: WorkflowDifficulty;
+    state: TaskState;
+    config: AssistantConfig;
+    blockerLedgerText?: string;
+  }): Promise<PlanResult> {
+    const prompt = buildRevisedPlanPrompt(input);
+    const output = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config, input.state);
+    const decisionParsed = parseAgentDecisionMarkdown(output.markdown, 'architect_plan');
+    const blockerParsed = parseAgentArchitectBlockerResponseMarkdown(decisionParsed.markdown);
+    return {
+      markdown: blockerParsed.markdown,
+      verificationCommands: extractVerificationCommands(blockerParsed.markdown),
+      planPackDraft: extractPlanPackDraft(blockerParsed.markdown),
+      agentPrompt: this.agentPromptRecord(prompt, input.difficulty, 'architect', input.state, input.config),
+      ...(output.sourcePath ? { sourcePath: output.sourcePath } : {}),
+      ...(output.stdoutSummary ? { stdoutSummary: output.stdoutSummary } : {}),
+      ...(decisionParsed.userDecision ? { userDecision: decisionParsed.userDecision } : {}),
+      ...(decisionParsed.decisionParseError ? { decisionParseError: decisionParsed.decisionParseError } : {}),
+      ...(blockerParsed.architectBlockerResponses ? { architectBlockerResponses: blockerParsed.architectBlockerResponses } : {}),
+      ...(blockerParsed.blockerResponseParseError ? { blockerResponseParseError: blockerParsed.blockerResponseParseError } : {}),
+    };
+  }
+
+  async implement(input: {
+    task: string;
+    projectContext: string;
+    revisedPlan: string;
+    executionUnit: ExecutionUnitState;
+    state: TaskState;
+    config: AssistantConfig;
+    mode: ImplementationMode;
+    finalReviewReason?: string;
+    priorImplementationLog?: string;
+    priorVerificationLog?: string;
+  }): Promise<ImplementationResult> {
+    const difficulty = input.state.difficulty ?? 'medium';
+    const prompt = input.mode === 'final_review_followup'
+      ? buildFinalReviewFollowupImplementationPrompt(input)
+      : [
+          'Act as the Developer. Implement only the current execution unit from the approved parent-task plan.',
+          `Project context:\n${input.projectContext}`,
+          `Task:\n${input.task}`,
+          `Approved revised plan:\n${input.revisedPlan}`,
+          `User workflow directives and requested changes:\n${input.state.requestedChanges.join('\n\n') || 'none'}`,
+          `Current execution unit:\nTask ${String(input.executionUnit.index).padStart(2, '0')}: ${input.executionUnit.name}`,
+          'Do not revert unrelated user changes. Report changed files at the end.',
+          'Run focused tests when practical and include the Test Result details for this execution unit.',
+          'When reading Markdown or other text files, preserve UTF-8 text. On Windows PowerShell, use Get-Content -Raw -Encoding utf8 for file content, and keep command output free of ANSI color codes.',
+        ].join('\n\n');
+    const output = await this.runWorkflowRole(prompt, difficulty, 'developer', input.config, input.state);
+    return {
+      markdown: output.markdown,
+      changedFiles: [],
+      agentPrompt: this.agentPromptRecord(prompt, difficulty, 'developer', input.state, input.config),
+      ...(output.sourcePath ? { sourcePath: output.sourcePath } : {}),
+      ...(output.stdoutSummary ? { stdoutSummary: output.stdoutSummary } : {}),
+    };
+  }
+
+  async finalReview(input: {
+    task: string;
+    projectContext: string;
+    revisedPlan: string;
+    implementationLog: string;
+    verificationLog: string;
+    state: TaskState;
+    config: AssistantConfig;
+  }): Promise<FinalReviewResult> {
+    const difficulty = input.state.difficulty ?? 'medium';
+    const prompt = [
+      'Act as the Final Reviewer. Review the whole parent task after all execution units are implemented. Do not review every subtask separately by default. Report blocking issues first.',
+      'Do not edit files. Re-run the relevant verification commands yourself when practical, especially npm test and npm run build when they are part of the plan or verification log. If you cannot rerun a command, say so explicitly.',
+      `Project context:\n${input.projectContext}`,
+      `Task:\n${input.task}`,
+      `Approved revised plan:\n${input.revisedPlan}`,
+      `Implementation log:\n${input.implementationLog}`,
+      `Verification:\n${input.verificationLog}`,
+    ].join('\n\n');
+    const output = await this.runWorkflowRole(prompt, difficulty, 'finalReviewer', input.config, input.state);
+    return {
+      markdown: output.markdown,
+      passed: !/\b(blocking|must fix|failed|regression)\b/i.test(output.markdown),
+      agentPrompt: this.agentPromptRecord(prompt, difficulty, 'finalReviewer', input.state, input.config),
+    };
+  }
+}
+
+function buildFinalReviewFollowupImplementationPrompt(input: {
+  task: string;
+  projectContext: string;
+  revisedPlan: string;
+  state: TaskState;
+  finalReviewReason?: string;
+  priorImplementationLog?: string;
+  priorVerificationLog?: string;
+}): string {
+  return [
+    'Act as the Developer. You are running a Final Review Follow-up, not the full approved plan.',
+    '',
+    'Hard constraints:',
+    '- Do NOT modify the approved plan.',
+    '- Do NOT add or remove execution units.',
+    '- Do NOT re-implement units that are already Done.',
+    '- Do NOT revert existing implementation unless the final reviewer called it defective.',
+    '- ONLY make the minimal changes required to address the final-review reason below.',
+    '- VibeCodingAssistant will run verification commands automatically; do not run them yourself unless needed for local diagnosis.',
+    '',
+    `Project context:\n${input.projectContext}`,
+    `Task:\n${input.task}`,
+    `Final review reason:\n${input.finalReviewReason?.trim() || 'Final review requested a contained implementation follow-up.'}`,
+    `Prior implementation log:\n${input.priorImplementationLog?.trim() || 'none'}`,
+    `Prior verification log:\n${input.priorVerificationLog?.trim() || 'none'}`,
+    `Approved revised plan:\n${input.revisedPlan}`,
+    `User workflow directives and requested changes:\n${input.state.requestedChanges.join('\n\n') || 'none'}`,
+    'Report only what you changed for this follow-up and any focused diagnostic command you ran manually.',
+    'When reading Markdown or other text files, preserve UTF-8 text. On Windows PowerShell, use Get-Content -Raw -Encoding utf8 for file content, and keep command output free of ANSI color codes.',
+  ].join('\n\n');
+}
+
+export function extractVerificationCommands(markdown: string): string[] {
+  return markdown
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .map((line) => line.replace(/^[-*]\s+/, '').replace(/^`(.+)`$/, '$1').trim())
+    .filter((line) => /^(npm (?:run )?(?:test|build|lint)|tsc --noEmit|npx tsc --noEmit)\b/.test(line));
+}
+
+export function extractPlanPackDraft(markdown: string): PlanPackDraft {
+  const category = markdown.match(/^\s*(?:Category|Task Category)\s*:\s*(.+?)\s*$/im)?.[1]
+    ?? markdown.match(/^\|\s*Category\s*\|\s*(.+?)\s*\|/im)?.[1];
+  const summary = sectionBody(markdown, 'Plan Summary') ?? firstNonHeadingParagraph(markdown);
+  const executionUnits = extractExecutionUnitDrafts(markdown);
+  return {
+    ...(category ? { category: category.trim() } : {}),
+    ...(summary ? { summary: summary.trim() } : {}),
+    ...(executionUnits.length > 0
+      ? { executionUnits }
+      : {}),
+  };
+}
+
+function extractExecutionUnitDrafts(markdown: string): Array<{ name: string }> {
+  const headingUnits = [...markdown.matchAll(/^\s*(?:#{1,4}\s*)?(?:\*\*)?(?:Task|Execution Unit)\s+\d{1,2}\s*:\s*(.+?)(?:\*\*)?\s*$/gim)]
+    .map((match) => cleanExecutionUnitName(match[1]))
+    .filter((name) => name.length > 0);
+  if (headingUnits.length > 0) return headingUnits.map((name) => ({ name }));
+
+  const lines = markdown.split(/\r?\n/);
+  const unitsHeaderIndex = lines.findIndex((line) => /^\s*(?:#{1,6}\s*)?(?:\*\*)?Execution units?(?:\*\*)?\s*:?\s*$/i.test(line));
+  if (unitsHeaderIndex < 0) return [];
+
+  const names: string[] = [];
+  for (const line of lines.slice(unitsHeaderIndex + 1)) {
+    if (names.length > 0 && isPlanSectionBoundary(line)) break;
+
+    const listMatch = line.match(/^\s{0,3}\d{1,2}[.)]\s+(.+?)\s*$/);
+    if (listMatch) {
+      const name = cleanExecutionUnitName(listMatch[1]);
+      if (name) names.push(name);
+      continue;
+    }
+
+    if (names.length === 0 && line.trim().length > 0) break;
+  }
+  return names.map((name) => ({ name }));
+}
+
+function cleanExecutionUnitName(value: string | undefined): string {
+  return (value ?? '').replace(/\*\*$/u, '').trim();
+}
+
+function isPlanSectionBoundary(line: string): boolean {
+  return /^\s*#{1,6}\s+\S/u.test(line)
+    || /^\s*(?:\*\*)?(?:Acceptance Criteria|Verification Commands|Test Plan|Plan Summary|Category|Parent Task)\b/i.test(line);
+}
+
+function sectionBody(markdown: string, heading: string): string | undefined {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = markdown.match(new RegExp(`^#{1,4}\\s+${escaped}\\s*$\\n([\\s\\S]*?)(?=\\n#{1,4}\\s+|$)`, 'im'));
+  return match?.[1]?.trim();
+}
+
+function firstNonHeadingParagraph(markdown: string): string | undefined {
+  return markdown
+    .split(/\n\s*\n/)
+    .map((paragraph) => paragraph.trim())
+    .find((paragraph) => paragraph.length > 0 && !paragraph.startsWith('#') && !paragraph.startsWith('|'));
+}
+
+export function createAssistantAdapter(config: AssistantConfig, env: NodeJS.ProcessEnv = process.env): AssistantAdapter {
+  const profileName = config.workflowRoles.assistant;
+  const profile = config.profiles[profileName];
+  if (!profile) {
+    throw new Error(`Workflow role assistant references missing profile ${profileName}.`);
+  }
+  return new OpenAICompatibleAssistantAdapter(profile, env, profileName);
+}
+
+export function createHeavyAgentAdapter(config: AssistantConfig, allowAgentCalls: boolean): HeavyAgentAdapter {
+  return allowAgentCalls ? new CliHeavyAgentAdapter(config) : new StubHeavyAgentAdapter();
+}

@@ -1,0 +1,91 @@
+{
+  "workspace": {
+    "targetDir": "C:/path/to/your/project"
+  },
+  "defaultProjectId": "example-project",
+  "projects": [
+    {
+      "id": "example-project",
+      "name": "Example Project",
+      "targetDir": "C:/path/to/your/project",
+      "docsDir": "project-docs/example-project",
+      "taskRecordRoot": "C:/path/to/your/project/task",
+      "alwaysRead": []
+    }
+  ],
+  "artifactsDir": "logs/ai-workflow",
+  "lark": {
+    "platform": "lark",
+    "appIdEnv": "LARK_APP_ID",
+    "appSecretEnv": "LARK_APP_SECRET",
+    "allowedOpenIds": ["ou_your_open_id_here"],
+    "taskMemberOpenIds": [],
+    "controlChatIds": []
+  },
+  "maxRevisionRounds": 3,
+  "workflowRoles": {
+    "assistant": "assistant-api",
+    "low": {
+      "architect": "architect-agent",
+      "planReviewer": "plan-reviewer-agent",
+      "developer": "developer-agent",
+      "finalReviewer": "final-reviewer-agent"
+    },
+    "medium": {
+      "architect": "architect-agent",
+      "planReviewer": "plan-reviewer-agent",
+      "developer": "developer-agent",
+      "finalReviewer": "final-reviewer-agent"
+    },
+    "high": {
+      "architect": "architect-agent",
+      "planReviewer": "plan-reviewer-agent",
+      "developer": "developer-agent",
+      "finalReviewer": "final-reviewer-agent"
+    },
+    "extra-high": {
+      "architect": "architect-agent",
+      "planReviewer": "plan-reviewer-agent",
+      "developer": "developer-agent",
+      "finalReviewer": "final-reviewer-agent"
+    }
+  },
+  "profiles": {
+    "assistant-api": {
+      "kind": "openai-compatible",
+      "model": "",
+      "baseUrl": "",
+      "apiKeyEnv": "ASSISTANT_API_KEY"
+    },
+    "architect-agent": {
+      "kind": "command",
+      "provider": "",
+      "command": ""
+    },
+    "plan-reviewer-agent": {
+      "kind": "command",
+      "provider": "",
+      "command": ""
+    },
+    "developer-agent": {
+      "kind": "command",
+      "provider": "",
+      "command": ""
+    },
+    "final-reviewer-agent": {
+      "kind": "command",
+      "provider": "",
+      "command": ""
+    }
+  },
+  "verification": {
+    "allowlist": [
+      "npm test",
+      "npm run test",
+      "npm run build",
+      "npm run lint",
+      "tsc --noEmit",
+      "npx tsc --noEmit"
+    ]
+  }
+}
